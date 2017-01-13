@@ -89,13 +89,7 @@ class cont : public cont_base
     std::aligned_storage_t<sizeof(T), alignof(T)> _storage;
 
 public:
-    explicit cont(bool default_emplace = true)
-    {
-        if (default_emplace)
-        {
-            emplace();
-        }
-    }
+    cont() = default;
 
     cont(const cont&) = delete;
     cont& operator=(const cont&) = delete;
