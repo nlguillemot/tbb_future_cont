@@ -194,6 +194,7 @@ class TaskA : public tbb::task
 
             // set the value of c
             c->emplace(1337);
+
             // broadcast that c is ready to all the successors enqueued on the cont.
             c->set_ready();
 
@@ -274,6 +275,7 @@ class MainTask : public tbb::task
 public:
     tbb::task* execute() override
     {
+        // this variable will be produced by a subtask of task A, and consumed by task C.
         cont<int> c;
 
         // 3 children + wait
