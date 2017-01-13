@@ -4,6 +4,9 @@
 #include <sstream>
 #include <cassert>
 #include <atomic>
+#include <thread>
+#include <mutex>
+#include <random>
 
 // node in a linked list of tasks that depend on a cont
 struct cont_node
@@ -78,8 +81,18 @@ public:
 
         // TODO: pick better than memory_order_seq_cst
         cont_node* old_head = _head.load(std::memory_order_seq_cst);
+
+        if ((intptr_t)old_head & 1)
+        {
+            // cont was already set, so can't register yourself.
+            // the caller should use this knowledge to know that they can just read from the cont without queueing themselves.
+            return false;
+        }
+
         new_head->next = old_head;
 
+        // it's possible for the successor notification queue to be closed concurrently while we're trying to add ourselves to it.
+        // in case that happens, this CAS will return false, and the user can therefore know the cont is already ready and they don't need to queue themselves.
         // TODO: pick better than memory_order_seq_cst and consider if I should use _explicit
         return _head.compare_exchange_strong(old_head, new_head, std::memory_order_seq_cst);
     }
@@ -176,6 +189,21 @@ void spawn_when_ready(tbb::task& t, cont_base** conts, cont_node* nodes, int num
     }
 }
 
+// wait for a random number of milliseconds, used to test the system with varying timings.
+void random_wait()
+{
+    static std::mt19937 e = std::mt19937(std::random_device()());
+    static std::mutex e_lock;
+
+    std::uniform_int_distribution<int> dist(1, 5000);
+    
+    e_lock.lock();
+    std::chrono::milliseconds wait_time(dist(e));
+    e_lock.unlock();
+
+    std::this_thread::sleep_for(wait_time);
+}
+
 class TaskA : public tbb::task
 {
     class A_Subtask1 : public tbb::task
@@ -190,13 +218,16 @@ class TaskA : public tbb::task
 
         tbb::task* execute() override
         {
-            std::cout << "A_Subtask1\n";
+            std::cout << "A_Subtask1 start\n";
+            random_wait();
 
             // set the value of c
             c->emplace(1337);
 
             // broadcast that c is ready to all the successors enqueued on the cont.
             c->set_ready();
+
+            std::cout << "A_Subtask1 end\n";
 
             return NULL;
         }
@@ -207,7 +238,9 @@ class TaskA : public tbb::task
     public:
         tbb::task* execute() override
         {
-            std::cout << "A_Subtask2\n";
+            std::cout << "A_Subtask2 start\n";
+            random_wait();
+            std::cout << "A_Subtask2 end\n";
 
             return NULL;
         }
@@ -223,13 +256,15 @@ public:
 
     tbb::task* execute() override
     {
-        std::cout << "A\n";
+        std::cout << "A start\n";
 
         // 2 children + wait
         set_ref_count(3);
 
         spawn(*new(allocate_child()) A_Subtask1(c));
         spawn_and_wait_for_all(*new(allocate_child()) A_Subtask2());
+
+        std::cout << "A end\n";
 
         return NULL;
     }
@@ -240,7 +275,9 @@ class TaskB : public tbb::task
 public:
     tbb::task* execute() override
     {
-        std::cout << "B\n";
+        std::cout << "B start\n";
+        random_wait();
+        std::cout << "B end\n";
 
         return NULL;
     }
@@ -260,11 +297,13 @@ public:
 
     tbb::task* execute() override
     {
-        std::cout << "C\n";
+        std::cout << "C start\n";
 
         std::stringstream ss;
         ss << "C received " << **c << "\n";
         std::cout << ss.rdbuf();
+
+        std::cout << "C end\n";
 
         return NULL;
     }
@@ -282,7 +321,12 @@ public:
         set_ref_count(4);
 
         spawn(*new(allocate_child()) TaskA(&c));
+
+        random_wait();
+
         spawn(*new(allocate_child()) TaskB());
+
+        random_wait();
 
         // run TaskC when all the conts are satisfied (cont "c" gets set inside TaskA)
         TaskC& taskC = *new(allocate_child()) TaskC(&c);
@@ -298,4 +342,5 @@ public:
 int main()
 {
     tbb::task::spawn_root_and_wait(*new(tbb::task::allocate_root()) MainTask());
+    system("pause");
 }
