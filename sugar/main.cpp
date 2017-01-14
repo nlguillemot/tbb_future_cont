@@ -130,7 +130,7 @@ public:
 
     const T* operator->() const
     {
-        return *reinterpret_cast<const T*>(&_storage);
+        return reinterpret_cast<const T*>(&_storage);
     }
 
     T& operator*()
