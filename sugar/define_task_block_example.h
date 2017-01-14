@@ -1,5 +1,7 @@
+// Implementation of define_task_block using cont stuff.
+// Just kept around as an example.
+
 #include <tbb/task.h>
-#include <tbb/task_group.h>
 
 #include <iostream>
 #include <sstream>
@@ -194,8 +196,36 @@ void spawn_when_ready(tbb::task& t, cont_base** conts, cont_node* nodes, int num
     }
 }
 
-class cont_task_group : public tbb::task_group
+class task_block
 {
+    tbb::task* _self;
+
+    task_block(tbb::task* self)
+        : _self(self)
+    { }
+
+    template<class TaskFun, bool WaitForAll = false>
+    class task_runner : public tbb::task
+    {
+        TaskFun mfun;
+
+    public:
+        explicit task_runner(TaskFun& fun)
+            : mfun(fun)
+        { }
+
+        tbb::task* execute() override
+        {
+            mfun();
+            if (WaitForAll)
+            {
+                increment_ref_count();
+                wait_for_all();
+            }
+            return NULL;
+        }
+    };
+
     template<class TaskFun, int NumConts>
     class cont_task_runner : public tbb::task
     {
@@ -217,21 +247,29 @@ class cont_task_group : public tbb::task_group
     };
 
 public:
+    task_block(const task_block&) = delete;
+    task_block& operator=(const task_block&) = delete;
+    task_block* operator&() const = delete;
+
+    template<class TaskFun>
+    void run(TaskFun&& tfun)
+    {
+        _self->spawn(*new (_self->allocate_additional_child_of(*_self)) task_runner<TaskFun>(tfun));
+    }
+
     template<int NumConts>
     class with_spawner
     {
-        tbb::task* owner;
+        task_block* tb;
         std::array<cont_base*, NumConts> conts;
 
-        with_spawner() = default;
-
     public:
-        friend class cont_task_group;
+        friend class task_block;
 
-        template<typename F>
-        void run(const F& f)
+        template<class TaskFun>
+        void run(TaskFun&& tfun)
         {
-            auto& t = *new (owner->allocate_additional_child_of(*owner)) cont_task_runner<const F, NumConts>(f);
+            auto& t = *new (tb->_self->allocate_additional_child_of(*tb->_self)) cont_task_runner<TaskFun, NumConts>(tfun);
             t.conts = conts;
             spawn_when_ready(t, t.conts.data(), t.nodes.data(), (int)t.conts.size());
         }
@@ -241,11 +279,52 @@ public:
     auto with(Cont&... conts)
     {
         with_spawner<sizeof...(conts)> spawner;
-        spawner.owner = &owner();
+        spawner.tb = this;
         spawner.conts = { (&conts)... };
         return spawner;
     }
+
+    void wait()
+    {
+        _self->increment_ref_count();
+        _self->wait_for_all();
+    }
+
+    tbb::task& task()
+    {
+        return *_self;
+    }
+
+    template<class TBlockFun>
+    static void define_task_block(TBlockFun&& tbfun)
+    {
+        task_block tb(&tbb::task::self());
+        tbfun(tb);
+        tb._self->increment_ref_count();
+        tb._self->wait_for_all();
+    }
+
+    template<class TBlockFun>
+    static void define_root_task_block(TBlockFun&& tbfun)
+    {
+        task_block tb(0);
+        auto task_fun = [&] { tbfun(tb); };
+        tb._self = new (tbb::task::allocate_root()) task_runner<decltype(task_fun), true>(task_fun);
+        tbb::task::spawn_root_and_wait(*tb._self);
+    }
 };
+
+template<class TBlockFun>
+void define_task_block(TBlockFun tbfun)
+{
+    task_block::define_task_block(tbfun);
+}
+
+template<class TBlockFun>
+void define_root_task_block(TBlockFun tbfun)
+{
+    task_block::define_root_task_block(tbfun);
+}
 
 // wait for a random number of milliseconds, used to test the system with varying timings.
 void random_wait()
@@ -268,18 +347,19 @@ void TaskA(cont<int>* c, int x)
 
     random_wait();
 
-    tbb::task_group g;
-    g.run([&] {
-        std::cout << "A Subtask 1 start\n";
-        random_wait();
-        c->emplace(1337);
-        c->set_ready();
-        std::cout << "A Subtask 1 end\n";
-    });
-    g.run_and_wait([&] {
-        std::cout << "A Subtask 2 start\n";
-        random_wait();
-        std::cout << "A Subtask 2 end\n";
+    define_task_block([&](task_block& tb) {
+        tb.run([&] {
+            std::cout << "A Subtask 1 start\n";
+            random_wait();
+            c->emplace(1337);
+            c->set_ready();
+            std::cout << "A Subtask 1 end\n";
+        });
+        tb.run([&] {
+            std::cout << "A Subtask 2 start\n";
+            random_wait();
+            std::cout << "A Subtask 2 end\n";
+        });
     });
 
     std::cout << "TaskA end\n";
@@ -308,12 +388,12 @@ void TaskC(int z)
 int main()
 {
     cont<int> c;
-    
-    cont_task_group g;
-    g.run([&] { TaskA(&c, 3); });
-    g.run([&] { TaskB(2); });
-    g.with(c).run([&] { TaskC(*c); });
-    g.wait();
+
+    define_root_task_block([&](task_block& tb) {
+        tb.run([&] { TaskA(&c, 3); });
+        tb.run([&] { TaskB(2); });
+        tb.with(c).run([&] { TaskC(*c); });
+    });
 
     system("pause");
 }
