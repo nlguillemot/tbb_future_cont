@@ -5,6 +5,9 @@
 #include <cassert>
 #include <atomic>
 #include <array>
+#include <thread>
+#include <mutex>
+#include <random>
 
 // node in a linked list of tasks that depend on a cont
 struct cont_node
@@ -198,7 +201,7 @@ class task_block
         : _self(self)
     { }
 
-    template<class TaskFun>
+    template<class TaskFun, bool WaitForAll = false>
     class task_runner : public tbb::task
     {
         TaskFun mfun;
@@ -211,6 +214,11 @@ class task_block
         tbb::task* execute() override
         {
             mfun();
+            if (WaitForAll)
+            {
+                increment_ref_count();
+                wait_for_all();
+            }
             return NULL;
         }
     };
@@ -243,7 +251,7 @@ public:
     template<class TaskFun>
     void run(TaskFun&& tfun)
     {
-        _self->add_ref_count(1);
+        _self->increment_ref_count();
         _self->spawn(*new (_self->allocate_child()) task_runner<TaskFun>(tfun));
     }
 
@@ -259,7 +267,7 @@ public:
         template<class TaskFun>
         void run(TaskFun&& tfun)
         {
-            tb->_self->add_ref_count(1);
+            tb->_self->increment_ref_count();
             auto& t = *new (tb->_self->allocate_child()) cont_task_runner<TaskFun, NumConts>(tfun);
             t.conts = conts;
             spawn_when_ready(t, t.conts.data(), t.nodes.data(), (int)t.conts.size());
@@ -277,8 +285,13 @@ public:
 
     void wait()
     {
-        _self->add_ref_count(1);
+        _self->increment_ref_count();
         _self->wait_for_all();
+    }
+
+    tbb::task& task()
+    {
+        return *_self;
     }
 
     template<class TBlockFun>
@@ -286,8 +299,17 @@ public:
     {
         task_block tb(&tbb::task::self());
         tbfun(tb);
-        tb._self->add_ref_count(1);
+        tb._self->increment_ref_count();
         tb._self->wait_for_all();
+    }
+
+    template<class TBlockFun>
+    static void define_root_task_block(TBlockFun&& tbfun)
+    {
+        task_block tb(0);
+        auto task_fun = [&] { tbfun(tb); };
+        tb._self = new (tbb::task::allocate_root()) task_runner<decltype(task_fun), true>(task_fun);
+        tbb::task::spawn_root_and_wait(*tb._self);
     }
 };
 
@@ -297,19 +319,45 @@ void define_task_block(TBlockFun tbfun)
     task_block::define_task_block(tbfun);
 }
 
+template<class TBlockFun>
+void define_root_task_block(TBlockFun tbfun)
+{
+    task_block::define_root_task_block(tbfun);
+}
+
+// wait for a random number of milliseconds, used to test the system with varying timings.
+void random_wait()
+{
+    static std::mt19937 e = std::mt19937(std::random_device()());
+    static std::mutex e_lock;
+
+    std::uniform_int_distribution<int> dist(1, 5000);
+
+    e_lock.lock();
+    std::chrono::milliseconds wait_time(dist(e));
+    e_lock.unlock();
+
+    std::this_thread::sleep_for(wait_time);
+}
+
 void TaskA(cont<int>* c, int x)
 {
     std::cout << "TaskA start\n";
 
+    random_wait();
+
     define_task_block([&](task_block& tb) {
         tb.run([&] {
             std::cout << "A Subtask 1 start\n";
+            random_wait();
             c->emplace(1337);
             c->set_ready();
             std::cout << "A Subtask 1 end\n";
         });
         tb.run([&] {
-            std::cout << "A Subtask 2\n";
+            std::cout << "A Subtask 2 start\n";
+            random_wait();
+            std::cout << "A Subtask 2 end\n";
         });
     });
 
@@ -318,24 +366,31 @@ void TaskA(cont<int>* c, int x)
 
 void TaskB(int y)
 {
-    std::cout << "TaskB\n";
+    std::cout << "TaskB start\n";
+    random_wait();
+    std::cout << "TaskB end\n";
 }
 
 void TaskC(int z)
 {
+    std::cout << "TaskC start\n";
+
     std::stringstream ss;
     ss << "TaskC received " << z << "\n";
     std::cout << ss.rdbuf();
+
+    random_wait();
+
+    std::cout << "TaskC end\n";
 }
 
 int main()
 {
-    define_task_block([&](task_block& tb) {
-        cont<int> c;
+    cont<int> c;
+    define_root_task_block([&](task_block& tb) {
         tb.run([&] { TaskA(&c, 3); });
         tb.run([&] { TaskB(2); });
         tb.with(c).run([&] { TaskC(*c); });
-        tb.wait();
     });
 
     system("pause");
