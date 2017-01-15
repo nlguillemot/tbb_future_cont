@@ -34,8 +34,7 @@ public:
     // return true if this cont has been set_ready()
     bool is_ready() const
     {
-        // TODO: pick better than memory_order_seq_cst?
-        return ((intptr_t)_head.load(std::memory_order_seq_cst) & 1) != 0;
+        return ((intptr_t)_head.load(std::memory_order_acquire) & 1) != 0;
     }
 
     // sends this cont to all successors in the linked list.
@@ -48,12 +47,10 @@ public:
         // mark the cont as ready atomically. readiness is indicated by the least significant bit of the head pointer.
         for (;;)
         {
-            // TODO: pick better than memory_order_seq_cst
-            old_head = _head.load(std::memory_order_seq_cst);
+            old_head = _head.load(std::memory_order_acquire);
             cont_node* ready_head = (cont_node*)((intptr_t)old_head | 1);
 
-            // TODO: pick better than memory_order_seq_cst and consider if I should use _explicit
-            if (_head.compare_exchange_weak(old_head, ready_head, std::memory_order_seq_cst))
+            if (_head.compare_exchange_weak(old_head, ready_head, std::memory_order_acq_rel, std::memory_order_relaxed))
             {
                 // If the CAS failed, that means a successor just added themselves to the list,
                 // since that successor thought this cont was not ready yet. (or possibly it was a spurious wakeup.)
@@ -81,22 +78,26 @@ public:
         cont_node* new_head = c;
         new_head->task = t;
 
-        // TODO: pick better than memory_order_seq_cst
-        cont_node* old_head = _head.load(std::memory_order_seq_cst);
-
-        if ((intptr_t)old_head & 1)
+        for (;;)
         {
-            // cont was already set, so can't register yourself.
-            // the caller should use this knowledge to know that they can just read from the cont without queueing themselves.
-            return false;
+            cont_node* old_head = _head.load(std::memory_order_acquire);
+
+            if ((intptr_t)old_head & 1)
+            {
+                // cont was already set, so can't register yourself.
+                // the caller should use this knowledge to know that they can just read from the cont without queueing themselves.
+                return false;
+            }
+
+            new_head->next = old_head;
+
+            // It's possible for the successor notification queue to be closed concurrently while we're trying to add ourselves to it.
+            // It's also possible for another successor to have registered themselves concurrently and beat this successor to the punch.
+            if (_head.compare_exchange_weak(old_head, new_head, std::memory_order_acq_rel, std::memory_order_relaxed))
+            {
+                return true;
+            }
         }
-
-        new_head->next = old_head;
-
-        // it's possible for the successor notification queue to be closed concurrently while we're trying to add ourselves to it.
-        // in case that happens, this CAS will return false, and the user can therefore know the cont is already ready and they don't need to queue themselves.
-        // TODO: pick better than memory_order_seq_cst and consider if I should use _explicit
-        return _head.compare_exchange_strong(old_head, new_head, std::memory_order_seq_cst);
     }
 };
 
